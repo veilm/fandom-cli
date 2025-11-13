@@ -17,7 +17,7 @@ import httpx
 API_TIMEOUT = 30
 REQUEST_DELAY = 0.2  # seconds between paged requests to stay polite
 MEDIA_DELAY_RANGE = (1.0, 10.0)
-DOWNLOAD_DELAY_RANGE = (1.0, 30.0)
+DOWNLOAD_DELAY_RANGE = (1.0, 20.0)
 DOWNLOAD_LOG_INTERVAL = 50
 MAX_BACKOFF_SECONDS = 2 * 60 * 60  # 2 hours
 MIN_FREE_BYTES = 10 * 1024**3  # 10 GB
@@ -227,7 +227,7 @@ def _log_download_progress(
     bytes_on_disk: int,
 ) -> None:
     percent = (completed_entries / total_entries) * 100 if total_entries else 0.0
-    eta_seconds = max(total_entries - completed_entries, 0) * 16
+    eta_seconds = max(total_entries - completed_entries, 0) * 11
     free_bytes = shutil.disk_usage(media_dir).free
     print(
         f"[download-media] {completed_entries}/{total_entries} entries ({percent:.2f}%); "
