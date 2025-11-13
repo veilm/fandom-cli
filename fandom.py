@@ -6,10 +6,11 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import shutil
 import time
 import urllib.parse
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional
+from typing import Dict, Iterator, List
 
 import httpx
 
@@ -42,39 +43,11 @@ def iter_all_pages(wiki: str, client: httpx.Client) -> Iterator[Dict[str, str]]:
         time.sleep(REQUEST_DELAY)
 
 
-def iter_all_images(
-    wiki: str,
-    client: httpx.Client,
-    max_items: Optional[int] = None,
-) -> Iterator[Dict[str, str]]:
-    params: Dict[str, str] = {
-        "action": "query",
-        "format": "json",
-        "list": "allimages",
-        "aiprop": "url|mime|size|sha1|timestamp|user|comment",
-        "ailimit": "max",
-    }
-    cont: Dict[str, str] = {}
-    yielded = 0
-    while True:
-        resp = client.get(
-            f"https://{wiki}.fandom.com/api.php",
-            params={**params, **cont},
-        )
-        resp.raise_for_status()
-        payload = resp.json()
-        for image in payload["query"]["allimages"]:
-            yield image
-            yielded += 1
-            if max_items is not None and yielded >= max_items:
-                return
-        if "continue" not in payload:
-            break
-        cont = payload["continue"]
-        time.sleep(random.uniform(*MEDIA_DELAY_RANGE))
-
-
 def command_all_pages(args: argparse.Namespace) -> None:
+    print(
+        f"[all-pages] Fetching namespace 0 pages for {args.wiki}. "
+        "Logs will appear roughly every request."
+    )
     pages: List[Dict[str, str]] = []
     headers = {"User-Agent": "fandom-cli/0.1 (+https://github.com/user/project)"}
     with httpx.Client(timeout=API_TIMEOUT, headers=headers) as client:
@@ -94,20 +67,89 @@ def command_all_pages(args: argparse.Namespace) -> None:
 
 
 def command_all_media(args: argparse.Namespace) -> None:
-    media: List[Dict[str, str]] = []
+    print(
+        f"[all-media] Fetching all files for {args.wiki}. "
+        "Writing chunks to disk and logging every 10 chunks."
+    )
     headers = {"User-Agent": "fandom-cli/0.1 (+https://github.com/user/project)"}
-    with httpx.Client(timeout=API_TIMEOUT, headers=headers) as client:
-        for entry in iter_all_images(args.wiki, client, args.limit):
-            # Titles are already unique (File:Name.ext). Include canonical file page URL.
-            entry["descriptionurl"] = entry.get(
-                "descriptionurl",
-                f"https://{args.wiki}.fandom.com/wiki/{urllib.parse.quote(entry['title'].replace(' ', '_'), safe=':/%')}",
-            )
-            media.append(entry)
     out_dir = Path("fandom-data") / args.wiki
     out_dir.mkdir(parents=True, exist_ok=True)
+    tmp_dir = out_dir / ".media-chunks"
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    params: Dict[str, str] = {
+        "action": "query",
+        "format": "json",
+        "list": "allimages",
+        "aiprop": "url|mime|size|sha1|timestamp|user|comment",
+        "ailimit": "max",
+    }
+    cont: Dict[str, str] = {}
+    chunk_idx = 0
+    total = 0
+    completed = False
+
+    with httpx.Client(timeout=API_TIMEOUT, headers=headers) as client:
+        while True:
+            resp = client.get(
+                f"https://{args.wiki}.fandom.com/api.php",
+                params={**params, **cont},
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            images = payload["query"]["allimages"]
+
+            if args.limit is not None:
+                remaining = args.limit - total
+                if remaining <= 0:
+                    completed = True
+                    break
+                images = images[:remaining]
+
+            if not images:
+                completed = "continue" not in payload
+                break
+
+            for entry in images:
+                entry["descriptionurl"] = entry.get(
+                    "descriptionurl",
+                    f"https://{args.wiki}.fandom.com/wiki/"
+                    f"{urllib.parse.quote(entry['title'].replace(' ', '_'), safe=':/%')}",
+                )
+
+            chunk_path = tmp_dir / f"chunk-{chunk_idx:05d}.json"
+            chunk_path.write_text(json.dumps(images, indent=2), encoding="utf-8")
+            chunk_idx += 1
+            total += len(images)
+            if chunk_idx % 10 == 0:
+                print(f"...chunk {chunk_idx} written ({total} media so far)")
+
+            if args.limit is not None and total >= args.limit:
+                completed = True
+                break
+
+            if "continue" not in payload:
+                completed = True
+                break
+
+            cont = payload["continue"]
+            time.sleep(random.uniform(*MEDIA_DELAY_RANGE))
+
+    if not completed:
+        print(
+            f"Stopped after {total} media entries; partial chunks left in {tmp_dir} for inspection."
+        )
+        return
+
+    media: List[Dict[str, str]] = []
+    for chunk_file in sorted(tmp_dir.glob("chunk-*.json")):
+        media.extend(json.loads(chunk_file.read_text(encoding="utf-8")))
+
     out_file = out_dir / "all_media_urls.json"
     out_file.write_text(json.dumps(media, indent=2), encoding="utf-8")
+    shutil.rmtree(tmp_dir)
     print(f"Wrote {len(media)} media entries to {out_file}")
 
 
