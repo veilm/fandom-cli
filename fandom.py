@@ -17,6 +17,10 @@ import httpx
 API_TIMEOUT = 30
 REQUEST_DELAY = 0.2  # seconds between paged requests to stay polite
 MEDIA_DELAY_RANGE = (1.0, 10.0)
+DOWNLOAD_DELAY_RANGE = (1.0, 30.0)
+DOWNLOAD_LOG_INTERVAL = 50
+MAX_BACKOFF_SECONDS = 2 * 60 * 60  # 2 hours
+MIN_FREE_BYTES = 10 * 1024**3  # 10 GB
 
 
 def iter_all_pages(wiki: str, client: httpx.Client) -> Iterator[Dict[str, str]]:
@@ -153,6 +157,173 @@ def command_all_media(args: argparse.Namespace) -> None:
     print(f"Wrote {len(media)} media entries to {out_file}")
 
 
+def _dir_size_bytes(path: Path) -> int:
+    if not path.exists():
+        return 0
+    total = 0
+    for file in path.rglob("*"):
+        if file.is_file():
+            total += file.stat().st_size
+    return total
+
+
+def _human_bytes(num: int) -> str:
+    step = 1024
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if num < step or unit == "TB":
+            return f"{num:.2f} {unit}"
+        num /= step
+    return f"{num:.2f} TB"
+
+
+def _format_eta(seconds: float) -> str:
+    seconds = int(seconds)
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def _download_file(client: httpx.Client, url: str, dest: Path) -> int:
+    tmp_path = dest.with_suffix(dest.suffix + ".part")
+    with client.stream("GET", url, follow_redirects=True) as resp:
+        resp.raise_for_status()
+        with tmp_path.open("wb") as fh:
+            for chunk in resp.iter_bytes():
+                fh.write(chunk)
+    tmp_path.replace(dest)
+    return dest.stat().st_size
+
+
+def _download_with_backoff(client: httpx.Client, url: str, dest: Path) -> int:
+    delay = 5.0
+    attempt = 1
+    while True:
+        try:
+            return _download_file(client, url, dest)
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            msg = f"HTTP {status}"
+        except httpx.HTTPError as exc:
+            msg = f"Network error: {exc}"
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            msg = f"Unexpected error: {exc}"
+        print(
+            f"[download-media] Download failed ({msg}) on attempt {attempt}. "
+            f"Next retry in {int(delay)}s."
+        )
+        if delay >= MAX_BACKOFF_SECONDS:
+            raise RuntimeError(
+                "Backoff exceeded 2 hours between attempts; aborting downloads."
+            ) from None
+        time.sleep(delay)
+        delay = min(delay * 2, MAX_BACKOFF_SECONDS)
+        attempt += 1
+
+
+def _log_download_progress(
+    media_dir: Path,
+    completed_entries: int,
+    total_entries: int,
+    bytes_on_disk: int,
+) -> None:
+    percent = (completed_entries / total_entries) * 100 if total_entries else 0.0
+    eta_seconds = max(total_entries - completed_entries, 0) * 16
+    free_bytes = shutil.disk_usage(media_dir).free
+    print(
+        f"[download-media] {completed_entries}/{total_entries} entries ({percent:.2f}%); "
+        f"{_human_bytes(bytes_on_disk)} stored in {media_dir}; "
+        f"ETA ~{_format_eta(eta_seconds)}; free space {_human_bytes(free_bytes)}."
+    )
+    if free_bytes < MIN_FREE_BYTES:
+        raise RuntimeError(
+            f"Less than {_human_bytes(MIN_FREE_BYTES)} free on the target filesystem; stopping downloads."
+        )
+
+
+def command_download_media(args: argparse.Namespace) -> None:
+    wiki = args.wiki
+    base_dir = Path("fandom-data") / wiki
+    manifest = base_dir / "all_media_urls.json"
+    if not manifest.exists():
+        print(
+            f"[download-media] Manifest not found at {manifest}. "
+            "Run 'all-media' first."
+        )
+        raise SystemExit(1)
+
+    media = json.loads(manifest.read_text(encoding="utf-8"))
+    if not isinstance(media, list) or not media:
+        print(f"[download-media] Manifest at {manifest} is empty; nothing to download.")
+        return
+    if args.limit:
+        media = media[: args.limit]
+
+    total_entries = len(media)
+    media_dir = base_dir / "media"
+    media_dir.mkdir(parents=True, exist_ok=True)
+    bytes_on_disk = _dir_size_bytes(media_dir)
+    print(
+        f"[download-media] Starting download for {total_entries} files on {wiki}. "
+        f"Random delay {DOWNLOAD_DELAY_RANGE[0]:.0f}-{DOWNLOAD_DELAY_RANGE[1]:.0f}s between downloads; "
+        f"logging every {DOWNLOAD_LOG_INTERVAL} downloads. Saving under {media_dir}."
+    )
+
+    headers = {"User-Agent": "fandom-cli/0.1 (+https://github.com/user/project)"}
+    completed_entries = 0
+    downloaded_files = 0
+    downloads_since_log = 0
+    client_timeout = httpx.Timeout(120.0, connect=30.0)
+
+    try:
+        with httpx.Client(timeout=client_timeout, headers=headers) as client:
+            for entry in media:
+                completed_entries += 1
+                url = entry.get("url")
+                if not url:
+                    continue
+                sha1 = entry.get("sha1")
+                name = entry.get("name") or entry.get("title", "file")
+                sanitized = name.replace(" ", "_")
+                filename = f"{sha1}_{sanitized}" if sha1 else sanitized
+                dest = media_dir / filename
+                if dest.exists():
+                    continue
+                if downloaded_files > 0:
+                    time.sleep(random.uniform(*DOWNLOAD_DELAY_RANGE))
+                try:
+                    size = _download_with_backoff(client, url, dest)
+                except RuntimeError as exc:
+                    print(f"[download-media] {exc}")
+                    return
+                downloaded_files += 1
+                downloads_since_log += 1
+                bytes_on_disk += size
+                if downloads_since_log >= DOWNLOAD_LOG_INTERVAL:
+                    try:
+                        _log_download_progress(
+                            media_dir, completed_entries, total_entries, bytes_on_disk
+                        )
+                    except RuntimeError as exc:
+                        print(f"[download-media] {exc}")
+                        return
+                    downloads_since_log = 0
+    finally:
+        if downloads_since_log:
+            try:
+                _log_download_progress(
+                    media_dir, completed_entries, total_entries, bytes_on_disk
+                )
+            except RuntimeError as exc:
+                print(f"[download-media] {exc}")
+                return
+
+    print(
+        f"[download-media] Completed. {downloaded_files} new files ensured in {media_dir} "
+        f"({completed_entries}/{total_entries} entries processed). "
+        f"Current storage usage: {_human_bytes(bytes_on_disk)}."
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Small helper CLI for Fandom APIs.")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -172,6 +343,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional cap on number of media records (useful for testing).",
     )
     all_media.set_defaults(func=command_all_media)
+
+    download_media = sub.add_parser(
+        "download-media",
+        help="Download every media asset listed in all_media_urls.json for a wiki.",
+    )
+    download_media.add_argument("wiki", help="Subdomain of the Fandom wiki, e.g. 'rezero'")
+    download_media.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Optional cap on number of manifest entries to download.",
+    )
+    download_media.set_defaults(func=command_download_media)
 
     return parser
 
