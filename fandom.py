@@ -293,6 +293,12 @@ def command_download_media(args: argparse.Namespace) -> None:
                 try:
                     size = _download_with_backoff(client, url, dest)
                 except RuntimeError as exc:
+                    if "aborting downloads" in str(exc).lower():
+                        print(
+                            "[download-media] Download aborted while fetching this entry:"
+                        )
+                        print(json.dumps(entry, indent=2, sort_keys=True))
+                        print(f"[download-media] Intended destination: {dest}")
                     print(f"[download-media] {exc}")
                     return
                 downloaded_files += 1
