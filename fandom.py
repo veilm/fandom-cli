@@ -10,7 +10,7 @@ import shutil
 import time
 import urllib.parse
 from pathlib import Path
-from typing import Dict, Iterator, List
+from typing import Any, Dict, Iterator, List
 
 import httpx
 
@@ -220,6 +220,28 @@ def _download_with_backoff(client: httpx.Client, url: str, dest: Path) -> int:
         attempt += 1
 
 
+def _destination_for_entry(media_dir: Path, entry: Dict[str, Any]) -> Path:
+    name = entry.get("name") or entry.get("title", "file")
+    sanitized = str(name).replace(" ", "_")
+    sha1 = entry.get("sha1")
+    filename = f"{sha1}_{sanitized}" if sha1 else sanitized
+    return media_dir / filename
+
+
+def _get_next_pending_entry(
+    media_entries: List[Dict[str, Any]], media_dir: Path
+) -> tuple[Dict[str, Any], Path] | None:
+    for entry in media_entries:
+        url = entry.get("url")
+        if not url:
+            continue
+        dest = _destination_for_entry(media_dir, entry)
+        if dest.exists():
+            continue
+        return entry, dest
+    return None
+
+
 def _log_download_progress(
     media_dir: Path,
     completed_entries: int,
@@ -281,11 +303,7 @@ def command_download_media(args: argparse.Namespace) -> None:
                 url = entry.get("url")
                 if not url:
                     continue
-                sha1 = entry.get("sha1")
-                name = entry.get("name") or entry.get("title", "file")
-                sanitized = name.replace(" ", "_")
-                filename = f"{sha1}_{sanitized}" if sha1 else sanitized
-                dest = media_dir / filename
+                dest = _destination_for_entry(media_dir, entry)
                 if dest.exists():
                     continue
                 if downloaded_files > 0:
@@ -330,6 +348,44 @@ def command_download_media(args: argparse.Namespace) -> None:
     )
 
 
+def command_view_next_download(args: argparse.Namespace) -> None:
+    wiki = args.wiki
+    base_dir = Path("fandom-data") / wiki
+    manifest = base_dir / "all_media_urls.json"
+    if not manifest.exists():
+        print(
+            f"[view-next-download] Manifest not found at {manifest}. "
+            "Run 'all-media' first."
+        )
+        raise SystemExit(1)
+
+    media = json.loads(manifest.read_text(encoding="utf-8"))
+    if not isinstance(media, list) or not media:
+        print(
+            f"[view-next-download] Manifest at {manifest} is empty; nothing to inspect."
+        )
+        return
+    if args.limit:
+        media = media[: args.limit]
+
+    media_dir = base_dir / "media"
+    media_dir.mkdir(parents=True, exist_ok=True)
+
+    pending = _get_next_pending_entry(media, media_dir)
+    if not pending:
+        print(
+            f"[view-next-download] All entries up to current limit already exist in {media_dir}."
+        )
+        return
+
+    entry, dest = pending
+    print(
+        "[view-next-download] Next pending download (dry run; no network requests performed):"
+    )
+    print(json.dumps(entry, indent=2, sort_keys=True))
+    print(f"[view-next-download] Intended destination: {dest}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Small helper CLI for Fandom APIs.")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -362,6 +418,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional cap on number of manifest entries to download.",
     )
     download_media.set_defaults(func=command_download_media)
+
+    view_next = sub.add_parser(
+        "view-next-download",
+        help="Print the next manifest entry download-media would process, without downloading.",
+    )
+    view_next.add_argument("wiki", help="Subdomain of the Fandom wiki, e.g. 'rezero'")
+    view_next.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Optional cap mirroring download-media's --limit for inspection.",
+    )
+    view_next.set_defaults(func=command_view_next_download)
 
     return parser
 
