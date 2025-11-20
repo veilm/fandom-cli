@@ -23,6 +23,14 @@ MAX_BACKOFF_SECONDS = 2 * 60 * 60  # 2 hours
 MIN_FREE_BYTES = 10 * 1024**3  # 10 GB
 
 
+class DownloadNotFoundError(Exception):
+    """Raised when the remote server reports the asset does not exist."""
+
+    def __init__(self, url: str) -> None:
+        super().__init__(f"Asset not found: {url}")
+        self.url = url
+
+
 def iter_all_pages(wiki: str, client: httpx.Client) -> Iterator[Dict[str, str]]:
     params: Dict[str, str] = {
         "action": "query",
@@ -202,6 +210,8 @@ def _download_with_backoff(client: httpx.Client, url: str, dest: Path) -> int:
             return _download_file(client, url, dest)
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
+            if status == 404:
+                raise DownloadNotFoundError(url) from None
             msg = f"HTTP {status}"
         except httpx.HTTPError as exc:
             msg = f"Network error: {exc}"
@@ -234,6 +244,8 @@ def _get_next_pending_entry(
     for entry in media_entries:
         url = entry.get("url")
         if not url:
+            continue
+        if entry.get("failure") is not None:
             continue
         dest = _destination_for_entry(media_dir, entry)
         if dest.exists():
@@ -303,6 +315,8 @@ def command_download_media(args: argparse.Namespace) -> None:
                 url = entry.get("url")
                 if not url:
                     continue
+                if entry.get("failure") is not None:
+                    continue
                 dest = _destination_for_entry(media_dir, entry)
                 if dest.exists():
                     continue
@@ -310,6 +324,15 @@ def command_download_media(args: argparse.Namespace) -> None:
                     time.sleep(random.uniform(*DOWNLOAD_DELAY_RANGE))
                 try:
                     size = _download_with_backoff(client, url, dest)
+                except DownloadNotFoundError:
+                    entry["failure"] = 404
+                    manifest.write_text(json.dumps(media, indent=2), encoding="utf-8")
+                    print(
+                        "[download-media] Recorded 404 for this entry; it will be skipped:"
+                    )
+                    print(json.dumps(entry, indent=2, sort_keys=True))
+                    print(f"[download-media] Intended destination: {dest}")
+                    continue
                 except RuntimeError as exc:
                     if "aborting downloads" in str(exc).lower():
                         print(
