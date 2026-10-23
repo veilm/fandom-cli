@@ -147,7 +147,7 @@ def command_all_media(args: argparse.Namespace) -> None:
                 break
 
             cont = payload["continue"]
-            time.sleep(random.uniform(*MEDIA_DELAY_RANGE))
+            time.sleep(random.uniform(args.sleep_min, args.sleep_max))
 
     if not completed:
         print(
@@ -191,23 +191,37 @@ def _format_eta(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
-def _download_file(client: httpx.Client, url: str, dest: Path) -> int:
+def _download_file(
+    client: httpx.Client, url: str, dest: Path, max_bytes_per_second: int = 0
+) -> int:
     tmp_path = dest.with_suffix(dest.suffix + ".part")
-    with client.stream("GET", url, follow_redirects=True) as resp:
+    with client.stream(
+        "GET", url, follow_redirects=True, headers={"Accept-Encoding": "identity"}
+    ) as resp:
         resp.raise_for_status()
         with tmp_path.open("wb") as fh:
-            for chunk in resp.iter_bytes():
+            started = time.monotonic()
+            received = 0
+            # Bound read-ahead and pace every block, including the final block.
+            for chunk in resp.iter_raw(chunk_size=64 * 1024):
+                received += len(chunk)
+                if max_bytes_per_second:
+                    delay = received / max_bytes_per_second - (time.monotonic() - started)
+                    if delay > 0:
+                        time.sleep(delay)
                 fh.write(chunk)
     tmp_path.replace(dest)
     return dest.stat().st_size
 
 
-def _download_with_backoff(client: httpx.Client, url: str, dest: Path) -> int:
+def _download_with_backoff(
+    client: httpx.Client, url: str, dest: Path, max_bytes_per_second: int = 0
+) -> int:
     delay = 5.0
     attempt = 1
     while True:
         try:
-            return _download_file(client, url, dest)
+            return _download_file(client, url, dest, max_bytes_per_second)
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
             if status == 404:
@@ -298,13 +312,15 @@ def command_download_media(args: argparse.Namespace) -> None:
     bytes_on_disk = _dir_size_bytes(media_dir)
     print(
         f"[download-media] Starting download for {total_entries} files on {wiki}. "
-        f"Random delay {DOWNLOAD_DELAY_RANGE[0]:.0f}-{DOWNLOAD_DELAY_RANGE[1]:.0f}s between downloads; "
+        f"Random delay {args.sleep_min:g}-{args.sleep_max:g}s between downloads; "
+        f"bandwidth limit {args.max_bytes_per_second or 'unlimited'} bytes/s; "
         f"logging every {DOWNLOAD_LOG_INTERVAL} downloads. Saving under {media_dir}."
     )
 
     headers = {"User-Agent": "fandom-cli/0.1 (+https://github.com/user/project)"}
     completed_entries = 0
     downloaded_files = 0
+    attempted_files = 0
     downloads_since_log = 0
     client_timeout = httpx.Timeout(120.0, connect=30.0)
 
@@ -320,10 +336,13 @@ def command_download_media(args: argparse.Namespace) -> None:
                 dest = _destination_for_entry(media_dir, entry)
                 if dest.exists():
                     continue
-                if downloaded_files > 0:
-                    time.sleep(random.uniform(*DOWNLOAD_DELAY_RANGE))
+                if attempted_files > 0:
+                    time.sleep(random.uniform(args.sleep_min, args.sleep_max))
+                attempted_files += 1
                 try:
-                    size = _download_with_backoff(client, url, dest)
+                    size = _download_with_backoff(
+                        client, url, dest, args.max_bytes_per_second
+                    )
                 except DownloadNotFoundError:
                     entry["failure"] = 404
                     manifest.write_text(json.dumps(media, indent=2), encoding="utf-8")
@@ -428,6 +447,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional cap on number of media records (useful for testing).",
     )
     all_media.set_defaults(func=command_all_media)
+    _add_sleep_options(all_media, MEDIA_DELAY_RANGE)
 
     download_media = sub.add_parser(
         "download-media",
@@ -441,6 +461,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional cap on number of manifest entries to download.",
     )
     download_media.set_defaults(func=command_download_media)
+    _add_sleep_options(download_media, DOWNLOAD_DELAY_RANGE)
+    download_media.add_argument(
+        "--max-bytes-per-second",
+        type=int,
+        default=0,
+        help="Maximum media download rate in bytes/s (0 means unlimited).",
+    )
 
     view_next = sub.add_parser(
         "view-next-download",
@@ -458,9 +485,28 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _add_sleep_options(
+    parser: argparse.ArgumentParser, defaults: tuple[float, float]
+) -> None:
+    parser.add_argument(
+        "--sleep-min", type=float, default=defaults[0],
+        help="Minimum pause between requests, in seconds.",
+    )
+    parser.add_argument(
+        "--sleep-max", type=float, default=defaults[1],
+        help="Maximum pause between requests, in seconds.",
+    )
+
+
 def main(argv: List[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if hasattr(args, "sleep_min") and not (
+        0 <= args.sleep_min <= args.sleep_max < float("inf")
+    ):
+        parser.error("sleep values must be finite and satisfy 0 <= sleep-min <= sleep-max")
+    if getattr(args, "max_bytes_per_second", 0) < 0:
+        parser.error("max-bytes-per-second must be nonnegative")
     try:
         args.func(args)
     except httpx.HTTPStatusError as exc:

@@ -16,3 +16,14 @@ uv run fandom.py download-media rezero          # fetch files into fandom-data/r
 Each command expects the wiki subdomain (e.g., `rezero`, `marvelstudios`, etc.). Results are written under `fandom-data/<wiki>/` so you can resume work or inspect the JSON artifacts later.
 
 You can also invoke each command with `--limit` to cap processing during development, and `all-media` must be run before `download-media` so that the manifest exists.
+
+Set request pauses and a download bandwidth cap explicitly for a slow archive:
+
+```bash
+uv run fandom.py all-media popnmusic --sleep-min 5 --sleep-max 15
+uv run fandom.py download-media popnmusic --sleep-min 5 --sleep-max 20 --max-bytes-per-second 5000000
+```
+
+Downloads are sequential. The rate cap uses bytes per second (5 MB/s is
+5,000,000 bytes/s), with reads paced in blocks of at most 64 KiB. Existing
+completed files are skipped on restart; interrupted `.part` files are retried.
