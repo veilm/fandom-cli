@@ -31,12 +31,15 @@ class AssetStream(httpx.SyncByteStream):
 
 
 class DownloadTests(unittest.TestCase):
-    def download(self, rate, fail=False):
+    def download(self, rate, fail=False, url='https://test/asset'):
         content = b'archive\x00' * 20000  # Includes a partial final 64 KiB block.
         clock = Clock()
 
         def serve(request):
             self.assertEqual(request.headers['accept-encoding'], 'identity')
+            if request.url.host == 'static.wikia.nocookie.net':
+                self.assertEqual(request.url.params['cb'], '123')
+                self.assertEqual(request.url.params.get_list('format'), ['original'])
             return httpx.Response(200, stream=AssetStream(content, fail))
 
         with tempfile.TemporaryDirectory() as directory:
@@ -46,11 +49,11 @@ class DownloadTests(unittest.TestCase):
                      patch.object(fandom.time, 'sleep', clock.sleep):
                     if fail:
                         with self.assertRaises(httpx.ReadError):
-                            fandom._download_file(client, 'https://test/asset', dest, rate)
+                            fandom._download_file(client, url, dest, rate)
                         self.assertFalse(dest.exists())
                         self.assertTrue(dest.with_suffix('.bin.part').exists())
                         return
-                    count = fandom._download_file(client, 'https://test/asset', dest, rate)
+                    count = fandom._download_file(client, url, dest, rate)
             self.assertEqual(count, len(content))
             self.assertEqual(dest.read_bytes(), content)
             self.assertFalse(dest.with_suffix('.bin.part').exists())
@@ -66,6 +69,15 @@ class DownloadTests(unittest.TestCase):
 
     def test_interrupted_file_is_not_marked_complete(self):
         self.download(500000, fail=True)
+
+    def test_cdn_request_preserves_original_format_and_cache_timestamp(self):
+        self.download(0, url='https://static.wikia.nocookie.net/wiki/asset?cb=123&format=webp')
+
+    def test_filename_with_slash_stays_in_media_directory(self):
+        media_dir = Path('/archive/media')
+        dest = fandom._destination_for_entry(media_dir, {'name': 'Smile/Mimi.jpeg'})
+        self.assertEqual(dest.parent, media_dir)
+        self.assertEqual(dest.name, 'Smile_Mimi.jpeg')
 
 
 if __name__ == '__main__':

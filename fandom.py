@@ -194,6 +194,13 @@ def _format_eta(seconds: float) -> str:
 def _download_file(
     client: httpx.Client, url: str, dest: Path, max_bytes_per_second: int = 0
 ) -> int:
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.hostname == "static.wikia.nocookie.net":
+        # Fandom otherwise silently serves optimized WebP under PNG/JPEG names.
+        query = [(k, v) for k, v in urllib.parse.parse_qsl(parsed.query)
+                 if k != "format"]
+        query.append(("format", "original"))
+        url = urllib.parse.urlunsplit(parsed._replace(query=urllib.parse.urlencode(query)))
     tmp_path = dest.with_suffix(dest.suffix + ".part")
     with client.stream(
         "GET", url, follow_redirects=True, headers={"Accept-Encoding": "identity"}
@@ -246,7 +253,7 @@ def _download_with_backoff(
 
 def _destination_for_entry(media_dir: Path, entry: Dict[str, Any]) -> Path:
     name = entry.get("name") or entry.get("title", "file")
-    sanitized = str(name).replace(" ", "_")
+    sanitized = str(name).replace(" ", "_").replace("/", "_").replace("\\", "_")
     sha1 = entry.get("sha1")
     filename = f"{sha1}_{sanitized}" if sha1 else sanitized
     return media_dir / filename

@@ -27,3 +27,5 @@ uv run fandom.py download-media popnmusic --sleep-min 5 --sleep-max 20 --max-byt
 Downloads are sequential. The rate cap uses bytes per second (5 MB/s is
 5,000,000 bytes/s), with reads paced in blocks of at most 64 KiB. Existing
 completed files are skipped on restart; interrupted `.part` files are retried.
+Fandom CDN requests explicitly select the original format to avoid automatic
+WebP conversion. Slashes in wiki filenames are replaced with underscores.
