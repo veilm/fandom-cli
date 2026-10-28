@@ -70,6 +70,14 @@ class DownloadTests(unittest.TestCase):
     def test_interrupted_file_is_not_marked_complete(self):
         self.download(500000, fail=True)
 
+    def test_empty_success_response_is_not_marked_complete(self):
+        transport = httpx.MockTransport(lambda request: httpx.Response(200, stream=AssetStream(b'')))
+        with tempfile.TemporaryDirectory() as directory, httpx.Client(transport=transport) as client:
+            dest = Path(directory) / 'asset.bin'
+            with self.assertRaises(httpx.DecodingError):
+                fandom._download_file(client, 'https://test/asset', dest)
+            self.assertFalse(dest.exists())
+
     def test_cdn_request_preserves_original_format_and_cache_timestamp(self):
         self.download(0, url='https://static.wikia.nocookie.net/wiki/asset?cb=123&format=webp')
 

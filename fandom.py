@@ -218,6 +218,8 @@ def _download_file(
                     if delay > 0:
                         time.sleep(delay)
                 fh.write(chunk)
+        if received == 0:
+            raise httpx.DecodingError("Empty media response", request=resp.request)
     tmp_path.replace(dest)
     return dest.stat().st_size
 
