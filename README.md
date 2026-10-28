@@ -29,3 +29,5 @@ Downloads are sequential. The rate cap uses bytes per second (5 MB/s is
 completed files are skipped on restart; interrupted `.part` files are retried.
 Fandom CDN requests explicitly select the original format to avoid automatic
 WebP conversion. Slashes in wiki filenames are replaced with underscores.
+Per-asset HTTP 400, 404 and 410 errors are recorded in the manifest and skipped;
+temporary server/network errors retain exponential backoff.

@@ -79,6 +79,39 @@ class DownloadTests(unittest.TestCase):
         self.assertEqual(dest.parent, media_dir)
         self.assertEqual(dest.name, 'Smile_Mimi.jpeg')
 
+    def test_permanent_asset_errors_are_not_retried(self):
+        for status in [400, 404, 410]:
+            with self.subTest(status=status):
+                requests = []
+                def serve(request):
+                    requests.append(request)
+                    return httpx.Response(status)
+                with tempfile.TemporaryDirectory() as directory, \
+                     httpx.Client(transport=httpx.MockTransport(serve)) as client, \
+                     patch.object(fandom.time, 'sleep') as sleep:
+                    with self.assertRaises(fandom.DownloadUnavailableError) as error:
+                        fandom._download_with_backoff(client, 'https://test/asset',
+                                                      Path(directory) / 'asset.bin')
+                    self.assertEqual(error.exception.status, status)
+                    self.assertEqual(len(requests), 1)
+                    sleep.assert_not_called()
+
+    def test_temporary_server_error_is_retried(self):
+        requests = []
+        def serve(request):
+            requests.append(request)
+            if len(requests) == 1:
+                return httpx.Response(503)
+            return httpx.Response(200, stream=AssetStream(b'recovered'))
+        with tempfile.TemporaryDirectory() as directory, \
+             httpx.Client(transport=httpx.MockTransport(serve)) as client, \
+             patch.object(fandom.time, 'sleep') as sleep:
+            dest = Path(directory) / 'asset.bin'
+            self.assertEqual(fandom._download_with_backoff(client, 'https://test/asset', dest), 9)
+            self.assertEqual(dest.read_bytes(), b'recovered')
+            self.assertEqual(len(requests), 2)
+            sleep.assert_called_once_with(5.0)
+
 
 if __name__ == '__main__':
     unittest.main()

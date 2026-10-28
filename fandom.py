@@ -23,12 +23,13 @@ MAX_BACKOFF_SECONDS = 2 * 60 * 60  # 2 hours
 MIN_FREE_BYTES = 10 * 1024**3  # 10 GB
 
 
-class DownloadNotFoundError(Exception):
-    """Raised when the remote server reports the asset does not exist."""
+class DownloadUnavailableError(Exception):
+    """Raised for a permanent per-asset HTTP error."""
 
-    def __init__(self, url: str) -> None:
-        super().__init__(f"Asset not found: {url}")
+    def __init__(self, url: str, status: int) -> None:
+        super().__init__(f"Asset unavailable (HTTP {status}): {url}")
         self.url = url
+        self.status = status
 
 
 def iter_all_pages(wiki: str, client: httpx.Client) -> Iterator[Dict[str, str]]:
@@ -231,8 +232,8 @@ def _download_with_backoff(
             return _download_file(client, url, dest, max_bytes_per_second)
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
-            if status == 404:
-                raise DownloadNotFoundError(url) from None
+            if status in (400, 404, 410):
+                raise DownloadUnavailableError(url, status) from None
             msg = f"HTTP {status}"
         except httpx.HTTPError as exc:
             msg = f"Network error: {exc}"
@@ -350,11 +351,12 @@ def command_download_media(args: argparse.Namespace) -> None:
                     size = _download_with_backoff(
                         client, url, dest, args.max_bytes_per_second
                     )
-                except DownloadNotFoundError:
-                    entry["failure"] = 404
+                except DownloadUnavailableError as exc:
+                    entry["failure"] = exc.status
                     manifest.write_text(json.dumps(media, indent=2), encoding="utf-8")
                     print(
-                        "[download-media] Recorded 404 for this entry; it will be skipped:"
+                        f"[download-media] Recorded HTTP {exc.status} for this entry; "
+                        "it will be skipped:"
                     )
                     print(json.dumps(entry, indent=2, sort_keys=True))
                     print(f"[download-media] Intended destination: {dest}")
